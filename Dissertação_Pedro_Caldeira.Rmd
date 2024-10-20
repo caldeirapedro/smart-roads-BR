@@ -1,0 +1,973 @@
+---
+title: "Modelo de simulação de implantação do sistema free flow"
+output: 
+  html_document:
+    code_folding: show
+    theme:
+      bg: "#FFFFFF"
+      fg: "#383A42"
+      primary: "#242636"
+      base_font:
+        google: Prompt
+      heading_font:
+        google: Proza Libre
+      version: 3
+---
+
+```{r setup, include=FALSE}
+if (requireNamespace("thematic")) 
+  thematic::thematic_rmd(font = "auto")
+```
+
+## Autor: Pedro Caldeira {.tabset .tabset-pills}
+
+### Sobre
+O modelo de simulação trata-se de uma ferramenta computacional projetada para identificar os impactos advindos da implantação de um sistema de cobrança free flow com objetivo de aumentar a base de pedagiamento e a proporcionalidade de pagamento. Considerando a relevância da Rodovia Presidente Dutra e a sua disponibilidade de dados face a sua recente licitação, optou-se pela construção do modelo tendo como estudo de caso o sistema rodoviário BR-116/101/RJ/SP (Via Dutra e Rio-Santos), atualmente operado pela concessionária CCR RioSP. 
+
+O modelo abrange dois modos de operação de praça de pedágio: o modelo de praça de pedágio tradicional e o modelo de cobrança de pedágio de fluxo livre (free flow) com política de preços baseada na distância percorrida. 
+
+### Bibliotecas Utilizadas
+
+```{r, message=FALSE}
+library(tidyr)
+library(dplyr)
+library(zoo)
+library(readr)
+library(ggplot2)
+library(shiny)
+library(plotly)
+library(scales)
+library(shinydashboard)
+library(DT)
+library(shinyWidgets)
+library(rhandsontable)
+
+```
+
+## Base de dados {.tabset .tabset-pills}
+
+
+### Tabelas
+
+Para rodar a simulação, substitua os dados nas tabelas listadas abaixo, com dados de qualquer rodovia, obedecendo o formato estabelecido nelas:
+
+"SECTION_DATA.csv"
+"TRAFFIC_VOLUME_DATA.csv"
+"TOLL_INFO_CONTRACT.csv"
+"BENCHMARKINGDATA.csv"
+
+O código abaixo fará a importação dos dados para ajuste do simulador a qualquer rodovia com pedágio:
+
+```{r, message=FALSE}
+#Declaração das variáveis
+
+Section_Input <- data.frame()
+Traffic_Volume_Input <- data.frame()
+Traffic_Axles_Input <- data.frame()
+Toll_Info_Contract <- data.frame()
+BenchData <- data.frame()
+
+#Importação dos arquivos com dados de rodovias em CSV, conforme o padrão estabelecido
+
+Section_Input <- read.csv("SECTION_DATA.csv", sep = ";", dec = ",")
+Traffic_Volume_Input <- read.csv("TRAFFIC_VOLUME_DATA.csv", sep = ";", dec = ",")
+Traffic_Axles_Input <- read.csv("TRAFFIC_AXLES_DATA.csv", sep = ";", dec = ",")
+Toll_Info_Contract <- read.csv("TOLL_INFO_CONTRACT.csv", sep = ";", dec = ",")
+BenchData <- read.csv("BENCHMARKINGDATA.csv", sep = ";", dec = ",")
+```
+
+### Tratamento
+
+**Dados das seções de tráfego a partir de "SECTION_DATA"**
+
+```{r, message=FALSE}
+
+#Declaração das variáveis
+
+Road_IDs <- data.frame()
+Mainline <- data.frame()
+Road_Locations <- data.frame()
+Toll_Locations <- data.frame()
+num_rows <- 0
+contract_year <- 0
+Section <- data.frame()
+Section_linear <- data.frame()
+Road_Directions <- data.frame()
+linear_km <- data.frame()
+linear_kmC <- data.frame()
+linear_kmD <- data.frame()
+AcRoad <- 0
+FRoadLength <- 0
+
+
+
+# Localização de Pedágios e Trechos
+
+Road_IDs <- unique(Section_Input["ROAD_ID"])
+Road_IDs$ID_ROAD <- seq(1, nrow(Road_IDs))
+Mainline <- unique(Section_Input["MAINLINE"])
+Road_Locations <- unique(Section_Input["ROAD_LOCATION"])
+Toll_Locations <- Section_Input[c("ROAD_ID","ROAD_LOCATION","START_KM","END_KM","DIRECTION","TOLLZONE","IS_TOLL")]
+Toll_Locations <- Toll_Locations[Toll_Locations$IS_TOLL > 0,]
+Toll_Locations <- Toll_Locations[order(Toll_Locations$TOLLZONE),]
+num_rows <- nrow(Toll_Locations)
+contract_year = ncol(Traffic_Axles_Input)
+Section <- cbind(IDSeq = seq_along(Section_Input$VOL_COLLECTION_REF), Section_Input)
+Section_linear <- subset(Section, Section$MAINLINE == "Mainline")
+Section$TOLLZONE <- gsub(" ", "", Section$TOLLZONE)
+Section$TOLLZONE <- gsub(" ", "", Section$TOLLZONE)
+
+
+
+# Linearização da Rodovia: Converte a referência atual dos marcos quilométricos da rodovia, para iniciarem em 0 no sentido crescente.
+
+linear_km <- unique(subset(Section_linear, select = c("IDSeq","DIRECTION","ROAD_ID", "ROAD_LOCATION", "START_KM", "END_KM","LENGTH")))
+linear_km <- merge(linear_km, Road_IDs, by = "ROAD_ID")
+linear_km <- linear_km %>% mutate(DIRECTION.X = ifelse(START_KM < END_KM, "C", "D"))
+Road_Directions <- linear_km %>% select(DIRECTION, DIRECTION.X) %>% distinct()
+linear_kmC <- subset(linear_km, linear_km$DIRECTION.X == "C")
+linear_kmC$START_KM <- as.numeric(linear_kmC$START_KM)
+linear_kmC <- linear_kmC %>% arrange(ID_ROAD, ROAD_LOCATION, START_KM)
+AcRoad <- 0
+FRoadLength <- 0
+linear_kmC$LENGTH <- linear_kmC$END_KM - linear_kmC$START_KM
+linear_kmC$KM_START_lin[1] <- 0
+
+  for (i in 2:nrow(linear_kmC)){
+  if (linear_kmC$ID_ROAD[i] == linear_kmC$ID_ROAD[i-1] ) {
+    FRoadLength <- linear_kmC$LENGTH[i-1]
+    AcRoad <- AcRoad + FRoadLength
+    linear_kmC$KM_START_lin[i] <- AcRoad
+  } else {
+    AcRoad <- 0
+    FRoadLength <- 0
+    AcRoad <- AcRoad + FRoadLength
+    linear_kmC$KM_START_lin[i] <- AcRoad
+  }
+}
+linear_kmD <- subset(linear_km, linear_km$DIRECTION.X == "D")
+linear_kmD$START_KM <- as.numeric(linear_kmD$START_KM)
+linear_kmD <- linear_kmD %>% 
+  arrange(ID_ROAD, ROAD_LOCATION, START_KM)
+AcRoad <- 0
+FRoadLength <- 0
+linear_kmD$KM_END_lin <- 0
+linear_kmD$LENGTH <- linear_kmD$START_KM - linear_kmD$END_KM
+linear_kmD$KM_END_lin[1] <- 0
+
+  for (i in 2:nrow(linear_kmD)){
+  if (linear_kmD$ID_ROAD[i] == linear_kmD$ID_ROAD[i-1] ) {
+    FRoadLength <- linear_kmD$LENGTH[i-1]
+    AcRoad <- AcRoad + FRoadLength
+    linear_kmD$KM_END_lin[i] <- AcRoad
+  } else {
+    AcRoad <- 0
+    FRoadLength <- 0
+    AcRoad <- AcRoad + FRoadLength
+    linear_kmD$KM_END_lin[i] <- AcRoad
+  }
+}
+
+linear_kmD$KM_START_lin <- linear_kmD$KM_END_lin + linear_kmD$LENGTH
+linear_kmC$KM_END_lin <- linear_kmC$KM_START_lin + linear_kmC$LENGTH
+linear_kmD <- linear_kmD[, names(linear_kmC)]
+linear_km <- rbind(linear_kmD, linear_kmC)
+
+Road_IDs <- select(Road_IDs, ROAD_ID)
+Road_IDs <- pull(Road_IDs,"ROAD_ID")
+```
+
+**Dados de pedágio e contrato "TOLL_INFO_CONTRACT"**
+
+```{r, message=FALSE}
+#Declaração das variáveis
+
+Toll_Info <- data.frame()
+Toll_Road_ID <- data.frame()
+SectionUnique <- data.frame()
+
+
+# Informações das Praças de Pedáagio
+
+Toll_Info <- data.frame(
+  ID = 1:num_rows, 
+  Toll_km_Tariff_Multilanes = as.numeric(Toll_Info_Contract$TARIFF_KM_MULTILANES), 
+  Toll_km_Tariff_Singlelanes = as.numeric(Toll_Info_Contract$TARIFF_KM_SINGLELANES), 
+  Toll_Actual_Coverage_Extension_Multilanes = as.numeric(Toll_Info_Contract$CURRENT_TOLL_COVERAGE_MULTILANES), 
+  Toll_Actual_Coverage_Extension_Singlelanes = as.numeric(Toll_Info_Contract$CURRENT_TOLL_COVERAGE_SINGLELANES), 
+  Toll_Duplicated_Coverage_Extension_Multilanes = as.numeric(Toll_Info_Contract$DUPLICATED_TOLL_COVERAGE_MULTILANES), 
+  Toll_Duplicated_Coverage_Extension_Singlelanes = as.numeric(Toll_Info_Contract$DUPLICATED_TOLL_COVERAGE_SINGLELANES), 
+  Duplication_Year = Toll_Info_Contract$DUPLICATED_ROAD_COLLECTION_YEAR, 
+  Toll_ID = Toll_Info_Contract$TOLL_ID)
+
+Toll_Info$Toll_Tariff_Actual <- Toll_Info$Toll_km_Tariff_Multilanes * Toll_Info$Toll_Actual_Coverage_Extension_Multilanes + Toll_Info$Toll_km_Tariff_Singlelanes * Toll_Info$Toll_Actual_Coverage_Extension_Singlelanes
+Toll_Info$Toll_Tariff_Duplicated <- Toll_Info$Toll_km_Tariff_Multilanes * Toll_Info$Toll_Duplicated_Coverage_Extension_Multilanes + Toll_Info$Toll_km_Tariff_Singlelanes * Toll_Info$Toll_Duplicated_Coverage_Extension_Singlelanes
+
+# Informações das Localizações das Praças de Pedágio e TCP
+  
+Toll_Road_ID <- Toll_Locations %>%
+  select(ROAD_ID, TOLLZONE)
+Toll_Road_ID$TOLLZONE <- gsub(" ", "", Toll_Road_ID$TOLLZONE)
+Toll_Road_ID$TOLLZONE <- gsub(" ", "", Toll_Road_ID$TOLLZONE)
+Toll_Info$TOLLZONE <- gsub(" ", "", Toll_Info$Toll_ID)
+Toll_Info$TOLLZONE <- gsub(" ", "", Toll_Info$TOLLZONE)
+Toll_Info <- left_join(Toll_Info, Toll_Road_ID, by = "TOLLZONE")
+
+SectionUnique <- unique(subset(Section, select = c("TOLLZONE", "MAINLINE", "TRAFFIC_SECTION")))
+
+for (i in 1:nrow(Toll_Info)){
+  Toll_Info$MLSections[i] <- sum(SectionUnique$TOLLZONE == Toll_Info$TOLLZONE[i] & SectionUnique$MAINLINE == "Mainline", na.rm = TRUE)
+  Toll_Info$TotalSections[i] <- nrow(subset(SectionUnique, TOLLZONE == Toll_Info$TOLLZONE[i]))
+  Toll_Info$SdSections[i] <- Toll_Info$TotalSections[i] - Toll_Info$MLSections[i]
+}
+
+Toll_Info$TCP <- Toll_Info$Toll_Actual_Coverage_Extension_Singlelanes + Toll_Info$Toll_Actual_Coverage_Extension_Multilanes
+TollTarifYear <- subset(Toll_Info, select = c(TOLLZONE, Duplication_Year, Toll_Tariff_Actual, Toll_Tariff_Duplicated))
+
+```
+
+**Dados de tráfego "TRAFFIC_VOLUME_DATA" e "TRAFFIC_AXLES_DATA"**
+
+```{r, message=FALSE}
+
+#Declaração das variáveis
+Traffic_Axles <- data.frame()
+Traffic_Volume <- data.frame()
+Traffic_Data <- data.frame()
+
+# Bases de Tráfego
+
+Traffic_Axles <- data.frame(Traffic_Axles_Input)
+Traffic_Axles <- cbind(IDSeq = seq_along(Traffic_Axles$TRAFFIC_VOL_COLLECTION_POINT), Traffic_Axles)
+n <- contract_year + 1
+Traffic_Axles <- pivot_longer(Traffic_Axles, cols = 3:n, names_to = "Year", values_to = "Axles_Volume")
+Traffic_Axles <- data.frame(IDSeq = Traffic_Axles$IDSeq, VOL_COLLECTION_REF = Traffic_Axles$TRAFFIC_VOL_COLLECTION_POINT,
+                                 Year = as.integer(gsub("X", "", Traffic_Axles$Year)),
+                                 Axles_Volume = as.integer(Traffic_Axles$Axles_Volume)*365)
+Traffic_Axles[is.na(Traffic_Axles)] <- 0
+
+Traffic_Volume <- data.frame(Traffic_Volume_Input)
+Traffic_Volume <- cbind(IDSeq = seq_along(Traffic_Volume$TRAFFIC_VOL_COLLECTION_POINT), Traffic_Volume)
+Traffic_Volume <- pivot_longer(Traffic_Volume, cols = 3:n, names_to = "Year", values_to = "Traffic_Volume") 
+
+
+
+
+Traffic_Volume <- data.frame(IDSeq = Traffic_Volume$IDSeq, VOL_COLLECTION_REF = Traffic_Volume$TRAFFIC_VOL_COLLECTION_POINT,
+                                 Year = as.integer(gsub("X", "", Traffic_Volume$Year)),
+                                 Traffic_Volume = as.integer(Traffic_Volume$Traffic_Volume)*365)
+Traffic_Volume[is.na(Traffic_Volume)] <- 0
+
+Traffic_Data <- left_join(Traffic_Axles, Traffic_Volume, by = c("VOL_COLLECTION_REF","IDSeq", "Year"))
+Traffic_Data <- left_join(Traffic_Data, Section, by = c("IDSeq", "VOL_COLLECTION_REF"))
+Traffic_Data <- Traffic_Data %>% left_join(TollTarifYear, by = "TOLLZONE")
+Traffic_Data$Tariff <- ifelse(Traffic_Data$Year < Traffic_Data$Duplication_Year, Traffic_Data$Toll_Tariff_Actual, Traffic_Data$Toll_Tariff_Duplicated)
+Traffic_Data[is.na(Traffic_Data)] <- 0
+
+```
+
+**Outros tratamentos de dados e combinação dos dados**
+
+```{r, message=FALSE}
+#Declaração das variáveis
+
+TrafficandTariff <- data.frame()
+Traffic_Data_Aux <- data.frame()
+Traffic_TradToll <- data.frame()
+
+
+#Combinação de Tráfego e Tarifa
+
+Traffic_Data_Aux <- Traffic_Data
+TrafficandTariff <- subset(Traffic_Data_Aux, select = c("TOLLZONE","IDSeq", "Year", "Axles_Volume", "Traffic_Volume", "Tariff", "ROAD_ID", "MAINLINE"))
+TrafficandTariff$Traffic_Volume <- as.numeric(TrafficandTariff$Traffic_Volume)
+TrafficandTariff$Axles_Volume <- as.numeric(TrafficandTariff$Axles_Volume)
+TrafficandTariff <- unique(TrafficandTariff, by = c("TOLLZONE", "Year"))
+TrafficandTariff$TCP <- left_join(TrafficandTariff, Toll_Info, by = "TOLLZONE")$TCP
+Traffic_Data_Aux <- left_join(Traffic_Data, linear_km, by = "IDSeq")
+Traffic_TradToll <- unique(subset(Traffic_Data_Aux, select = c("IDSeq", "TOLLZONE", "IS_TOLL", "Year", "Axles_Volume", "Traffic_Volume", "Tariff"))) %>% 
+  arrange(TOLLZONE, Year)
+Traffic_TradToll <- filter(Traffic_TradToll, IS_TOLL == 1)
+```
+
+**Criação da Matriz de Origem e Destino**
+
+```{r}
+#Declaração das variáveis
+ODTradMatrix <- data.frame()
+ODTradMatrix_AUX <- matrix(0, nrow = num_rows, ncol = num_rows)
+num_rows <- 0
+
+
+#Base OD Tarifa Tradicional
+
+ODTradMatrix_AUX <- left_join(linear_km, Traffic_TradToll, by = "IDSeq")
+ODTradMatrix_AUX$Tariff <- replace(ODTradMatrix_AUX$Tariff, is.na(ODTradMatrix_AUX$Tariff), 0)
+
+ODTradMatrix_AUX <- unique(select(ODTradMatrix_AUX, ROAD_ID, START_KM, END_KM, KM_START_lin, KM_END_lin))
+
+ODTradMatrix_AUX <- ODTradMatrix_AUX %>%
+  group_by(ROAD_ID) %>%
+  arrange(KM_START_lin)
+  
+num_rows <- length(unique(ODTradMatrix_AUX$KM_START_lin))
+
+
+
+ODTradMatrix <- matrix(0, nrow = num_rows, ncol = num_rows)
+
+
+```
+
+
+### Análise dos Dados
+
+Neste etapa, verificamos se os dados importados estão corretos e prontos para serem utilizados na simulação.
+
+**Dados das seções de tráfego a partir de "SECTION_DATA"**
+
+```{r, message=FALSE}
+#Declaração das variáveis
+Resumo_linear_km <- data.frame()
+
+#Análise
+Resumo_linear_km <- linear_km %>%
+  group_by(ROAD_ID, DIRECTION.X) %>%
+  summarise(
+    Min_START_KM_lin = min(KM_START_lin),
+    Max_END_KM_lin = max(KM_END_lin),
+    Qty_SH = n(),
+    Media_DIST = mean(LENGTH))
+
+#Resultados
+datatable(Resumo_linear_km)
+print(Road_IDs)
+
+```
+
+**Dados de pedágio e contrato "TOLL_INFO_CONTRACT"**
+
+```{r, message=FALSE}
+#Declaração das variáveis
+Resumo_Toll_Info <- data.frame()
+Resumo_Toll_Tariff <- data.frame()
+
+#Análise
+
+Resumo_Toll_Info <- summary(Toll_Info)
+
+Resumo_Toll_Info <- Toll_Info %>%
+  group_by(TOLLZONE) %>%
+  summarise(
+    Min_Toll_Tariff_Actual = min(Toll_Tariff_Actual),
+    Max_Toll_Tariff_Actual = max(Toll_Tariff_Actual),
+    Min_Toll_Tariff_Duplicated = min(Toll_Tariff_Duplicated),
+    Max_Toll_Tariff_Duplicated = max(Toll_Tariff_Duplicated),
+    Min_Duplication_Year = min(Duplication_Year),
+    Max_Duplication_Year = max(Duplication_Year),
+    Min_TCP = min(TCP),
+    Max_TCP = max(TCP),
+    Min_MLSections = min(MLSections),
+    Max_MLSections = max(MLSections),
+    Min_TotalSections = min(TotalSections),
+    Max_TotalSections = max(TotalSections),
+    Min_SdSections = min(SdSections),
+    Max_SdSections = max(SdSections))
+
+Resumo_Toll_Tariff <- Toll_Info %>% 
+  group_by(TOLLZONE) %>% 
+  summarise(
+    Min_Toll_Tariff_Actual = min(Toll_Tariff_Actual),
+    Max_Toll_Tariff_Actual = max(Toll_Tariff_Actual),
+    Min_Toll_Tariff_Duplicated = min(Toll_Tariff_Duplicated),
+    Max_Toll_Tariff_Duplicated = max(Toll_Tariff_Duplicated))
+
+#Resultados
+datatable(Resumo_Toll_Info)
+datatable(Resumo_Toll_Tariff)
+
+```
+
+**Dados de tráfego "TRAFFIC_VOLUME_DATA" e "TRAFFIC_AXLES_DATA"**
+
+```{r, message=FALSE}
+#Declaração das variáveis
+Resumo_Traffic_Data <- data.frame()
+Resumo_Traffic_Volume <- data.frame()
+Resumo_Traffic_Axles <- data.frame()
+
+
+#Análise
+Resumo_Traffic_Data <- Traffic_Data %>%
+  group_by(ROAD_ID, Year) %>%
+  summarise(
+    Min_Axles_Volume = min(Axles_Volume),
+    Max_Axles_Volume = max(Axles_Volume),
+    Mean_Axl_Volume = mean(Axles_Volume),
+    Min_Traffic_Volume = min(Traffic_Volume),
+    Max_Traffic_Volume = max(Traffic_Volume),
+    Mean_Traffic_Volume = mean(Traffic_Volume))
+
+Traffic_Curve <- Traffic_Data %>%
+  group_by(ROAD_ID, Year) %>%
+  summarise(
+    sum_Axles_Volume = sum(Axles_Volume))
+
+# Resultados
+datatable(Resumo_Traffic_Data)
+
+# Criando um vetor de cores para cada ROAD_ID
+cores <- rainbow(length(unique(Traffic_Curve$ROAD_ID)))
+
+# Criando o gráfico com cores diferentes para cada ROAD_ID
+ggplot(data = Traffic_Curve, aes(x = Year, y = sum_Axles_Volume, color = as.factor(ROAD_ID))) +
+  geom_line() +
+  labs(x = "Ano", y = "Volume de Tráfego", title = "Volume de Tráfego por Ano") +
+  scale_color_manual(values = cores)
+
+# Criando o gráfico de barras comparáveis para cada ROAD_ID
+ggplot(data = Traffic_Curve, aes(x = Year, y = sum_Axles_Volume, fill = as.factor(ROAD_ID))) +
+  geom_bar(stat = "identity") +
+  labs(x = "Ano", y = "Volume de Tráfego", title = "Volume de Tráfego por Ano") +
+  scale_fill_discrete(name = "ROAD_ID")
+
+
+```
+
+
+
+## Simulação {.tabset .tabset-pills}
+
+### Inputs
+
+```{r}
+# Definir os parâmetros de entrada
+  
+  StartYear <- 2022
+  EndYear <- 2052
+  inputRoad <- "BR-116"
+  SLane = "yes"
+  Lane =     if (SLane == "yes") {"Mainline and Side Lane"} else {"Mainline Only"}
+  WACC <- 0.0847
+  Revenue_Taxes <- 0.0865
+  Income_Taxes <- 0.34
+  TradOBU <- 0.75
+  TradEvasion <- 0.01
+  inv_trad <- "yes"
+  TCAPEX <-  8266766.42 
+  TREPEX <-  900392.57 
+  TREPEX_Freq <- 8
+  FFOBU <- 0.8
+  FFCAPEX <-  1351663.25 
+  FFREPEX <-  675831.63 
+  FFREPEX_Freq <- 5
+  TFixCost <- 0 
+  FfixCost <- 0
+  SCENARIO = "S1"
+  S1 = ifelse(SCENARIO == "S1", 1, 0)
+  S2 = ifelse(SCENARIO == "S2", 1, 0)
+  S3 = ifelse(SCENARIO == "S3", 1, 0)
+  S4 = ifelse(SCENARIO == "S4", 1, 0)
+  costTDcash <-  0.06 * 4.176988667 * S1 + 0.29 * 4.176988667 * S2 + 0.29 * 4.176988667 * S3 + 0.06 * 4.176988667 * S4  
+  costTDOBU <-  0.06 * 4.176988667 * S1 + 0.15 * 4.176988667 * S2 + 0.15 * 4.176988667 * S3 + 0.15 * 4.176988667 * S4 
+  costFFVideo <- 0.24 * 4.176988667 * S1 + 0.31 * 4.176988667 * S2 + 0.31 * 4.176988667 * S3 + 0.31 * 4.176988667 * S4 
+  SCENARIOLEAK = SCENARIO
+  S1E = ifelse(SCENARIOLEAK == "S1", 1, 0)
+  S2E = ifelse(SCENARIOLEAK == "S2", 1, 0)
+  S3E = ifelse(SCENARIOLEAK == "S3", 1, 0)
+  S4E = ifelse(SCENARIOLEAK == "S4", 1, 0)
+  FFEvasion <- 0.035 * S1E + 0.045 * S2E + 0.09 * S3E + 0.15 * S4E
+  costENFF <-  0
+  cost_target <- 0.05
+  cost_eff <- "linear"
+  leak_target <- 0.00
+  leak_eff <- "linear"
+  fosimulation <- "Maximize Revenue"
+  ecbalance <- "Toll NPV"
+  sensitivityPercCost <- 0.05
+  sensitivityPercLeak <- 0.01
+  
+  leakcurve <- function(StartYear, EndYear, leak_eff, leak_target) {
+  leak_eff_curve <- data.frame(Year = seq(StartYear, EndYear, by = 1),
+  Leak_Multiplier = if (leak_eff == "linear") {seq(1, 1-leak_target, length.out = EndYear - StartYear + 1)} else {1 - exp(-seq(1, 1-leak_eff, length.out = EndYear - StartYear + 1))})}
+  
+  costcurve <- function(StartYear, EndYear, cost_eff, cost_target) {
+  cost_eff_curve <- data.frame(
+  Year = seq(StartYear, EndYear, by = 1),
+  Cost_Multiplier = if (cost_eff == "linear") {seq(1, 1-cost_target, length.out = EndYear - StartYear + 1)} else {1 - exp(-seq(1, c1-cost_target, length.out = EndYear - StartYear + 1))})}
+  
+  leak_eff_curve <- leakcurve(StartYear, EndYear, leak_eff, leak_target)
+  cost_eff_curve <- costcurve(StartYear, EndYear, cost_eff, cost_target)
+  
+  Toll_Select <- filter(Toll_Info, ROAD_ID == inputRoad)
+  num_rows <- length(Toll_Select$TOLLZONE)
+  inputDF <- read.csv("TOLL_CONVERSION.csv", sep = ";", dec = ",")
+  inputDF$Toll_Tariff_Actual <- as.numeric(inputDF$Toll_Tariff_Actual)
+  inputDF$Toll_Tariff_Duplicated <- as.numeric(inputDF$Toll_Tariff_Duplicated)
+  inputDF$TCP <- as.numeric(inputDF$TCP)
+  inputDF$Average_collection_distance <- as.numeric(inputDF$Average_collection_distance)
+SensitivityDF = function(sensitivityPercCost, sensitivityPercLeak) {
+Sensitivity <- data.frame(CostSensitivity = c(1, 1 + sensitivityPercCost, 1 - sensitivityPercCost), LeakSensitivity = c(1, 1 + sensitivityPercLeak, 1 - sensitivityPercLeak), Description = c("Base Case", "+ %var", "-% var"))}
+
+Sensitivity <- SensitivityDF(sensitivityPercCost, sensitivityPercLeak)
+
+SensCost = 1
+SensLeak = 1
+```
+
+### Cálculo
+
+**Praça Tradicional**
+
+```{r}
+# Praça Tradicional
+  
+  BaseCase_Simulation <- function(TrafficandTariff, inputRoad, StartYear, EndYear, WACC, Revenue_Taxes, Income_Taxes, TradOBU, TradEvasion, costTDcash, costTDOBU, TFixCost, inv_trad, TCAPEX, TREPEX, TREPEX_Freq, leak_eff_curve, cost_eff_curve) {
+  
+  Trad_simulation <- select(TrafficandTariff, TOLLZONE, IDSeq, Year, Axles_Volume, Traffic_Volume, Tariff, ROAD_ID, TCP) %>% 
+    filter(Year >= StartYear & Year <= EndYear)
+  
+  Trad_simulation <- select(Trad_simulation, TOLLZONE, IDSeq, Year, Axles_Volume, Traffic_Volume, Tariff, ROAD_ID, TCP) %>% 
+    filter(ROAD_ID == inputRoad)
+ 
+  Trad_simulation <- distinct(Trad_simulation, TOLLZONE, Year, .keep_all = TRUE)
+  
+  Trad_simulation$km_Tariff <- Trad_simulation$Tariff / Trad_simulation$TCP
+  
+  Trad_simulation$Leak_Curve <- left_join(Trad_simulation, leak_eff_curve, by = "Year")$Leak_Multiplier
+  
+  Trad_simulation$GrossRevenue <- Trad_simulation$Axles_Volume * Trad_simulation$Tariff * (1 - TradEvasion * Trad_simulation$Leak_Curve)
+    
+  Trad_simulation$NetRevenue <- Trad_simulation$GrossRevenue * (1-Revenue_Taxes)
+  
+  Trad_simulation$VariableCost <- costTDcash * Trad_simulation$Traffic_Volume * (1-TradOBU) + costTDOBU * Trad_simulation$Traffic_Volume * TradOBU
+  
+  Trad_simulation$FixedCost <- TFixCost
+  
+  Trad_simulation$Cost_Curve <- left_join(Trad_simulation, cost_eff_curve, by = "Year")$Cost_Multiplier
+  
+  Trad_simulation$TotlCost <- (Trad_simulation$VariableCost + Trad_simulation$FixedCost) * Trad_simulation$Cost_Curve
+  
+  Trad_simulation$OperationalProfit <- Trad_simulation$NetRevenue - Trad_simulation$TotlCost
+  
+  Trad_simulation$Investment <- ifelse(Trad_simulation$Year == StartYear, TCAPEX, 0)
+  
+  Trad_simulation$Reinvestment <- ifelse(Trad_simulation$Year %in% seq(StartYear + TREPEX_Freq, EndYear, by = TREPEX_Freq), TREPEX, 0)
+  
+  Trad_simulation$Depreciation <- ifelse(Trad_simulation$Year < StartYear + TREPEX_Freq, TCAPEX / TREPEX_Freq, TREPEX / TREPEX_Freq)
+
+  Trad_simulation$TotalCapex <- if (inv_trad == "yes") {
+    Trad_simulation$Investment + Trad_simulation$Reinvestment
+  } else {
+    0
+  }
+  
+  
+  Trad_simulation$CashFlow <- Trad_simulation$OperationalProfit - Trad_simulation$TotalCapex - (Trad_simulation$OperationalProfit - Trad_simulation$Depreciation)* Income_Taxes
+  
+  Trad_simulation$NetCashFlow <- Trad_simulation$CashFlow / ((1 + WACC)^(Trad_simulation$Year - StartYear))
+  
+  Trad_simulation$IncomeTaxes <- (Trad_simulation$OperationalProfit - Trad_simulation$Depreciation)* Income_Taxes
+  Trad_simulation$RevenueTaxes <- Trad_simulation$GrossRevenue * Revenue_Taxes
+  
+    return(Trad_simulation)
+  
+  
+  
+  }
+```
+
+**Free Flow sem Equilíbrio Econômico**
+
+```{r}
+# Free Flow sem Equilíbrio Econômico
+
+Generate_Free_Flow_Simulation <- function(inputDF, inputRoad, StartYear, EndYear, WACC, Revenue_Taxes, Income_Taxes, FFEvasion, FFOBU, costFFVideo, costTDOBU, costENFF, FfixCost, FFCAPEX, FFREPEX, FFREPEX_Freq, sensitivityPercCost, sensitivityPercLeak, leak_target, leak_eff, cost_target, cost_eff, fosimulation, ecbalance, SLane) {
+  
+  
+  FF_simulation <- select(TrafficandTariff, TOLLZONE, IDSeq, Year, Axles_Volume, Traffic_Volume, Tariff, ROAD_ID, MAINLINE) %>% 
+    filter(Year >= StartYear & Year <= EndYear)
+  
+  if (SLane == "no") {
+    FF_simulation <- select(FF_simulation, TOLLZONE, IDSeq, Year, Axles_Volume, Traffic_Volume, Tariff, ROAD_ID, MAINLINE) %>% 
+    filter(MAINLINE == "Mainline")
+  } else {
+    FF_simulation <- select(FF_simulation, TOLLZONE, IDSeq, Year, Axles_Volume, Traffic_Volume, Tariff, ROAD_ID, MAINLINE) %>% 
+    filter(MAINLINE == "Mainline" | MAINLINE == "Side Lane")
+  }
+  
+  FF_simulation <- select(FF_simulation, TOLLZONE, IDSeq, Year, Axles_Volume, Traffic_Volume, Tariff, ROAD_ID, MAINLINE) %>% 
+    filter(ROAD_ID == inputRoad)
+  
+  TCP = data.frame(TCP = Toll_Select$Toll_Actual_Coverage_Extension_Singlelanes + Toll_Select$Toll_Actual_Coverage_Extension_Multilanes, TOLLZONE = Toll_Select$TOLLZONE)
+  
+  FF_simulation$TCP <- left_join(FF_simulation, TCP, by = "TOLLZONE")$TCP
+  
+  FF_simulation$km_Tariff <- FF_simulation$Tariff / FF_simulation$TCP
+  
+  NewTCP <- data.frame(NewTCP = inputDF$Average_collection_distance, TOLLZONE = inputDF$Toll_Plaza)
+  
+  KeepToll <- data.frame(Convert = inputDF$Convert_to_ORT, TOLLZONE = inputDF$Toll_Plaza)
+  
+  FF_simulation$NewTCP <- left_join(FF_simulation, NewTCP, by = "TOLLZONE")$NewTCP
+  FF_simulation$Convert <- left_join(FF_simulation, KeepToll, by = "TOLLZONE")$Convert
+  
+  FF_simulation_Convert <- filter(FF_simulation, Convert == "Yes")
+  
+  FF_simulation_Convert$Tariff <- FF_simulation_Convert$km_Tariff * FF_simulation_Convert$NewTCP
+  
+  FF_simulation_KeepToll <- filter(FF_simulation, Convert == "No")
+  FF_simulation_KeepToll <- distinct(FF_simulation_KeepToll, TOLLZONE, Year, .keep_all = TRUE)
+  
+  FF_simulation <- rbind(FF_simulation_Convert, FF_simulation_KeepToll)
+  
+  FF_simulation$Leak_Curve <- left_join(FF_simulation, leak_eff_curve, by = "Year")$Leak_Multiplier
+  
+  FF_simulation$GrossRevenue <- FF_simulation$Axles_Volume * FF_simulation$Tariff * (1-FFEvasion * FF_simulation$Leak_Curve)
+  
+  FF_simulation$NetRevenue <- FF_simulation$GrossRevenue * (1-Revenue_Taxes)
+  
+  FF_simulation$VariableCost <- costFFVideo * FF_simulation$Traffic_Volume * (1-FFOBU) + costTDOBU *  FF_simulation$Traffic_Volume * FFOBU + costENFF * FF_simulation$Traffic_Volume * FFEvasion * FF_simulation$Leak_Curve
+  
+  FF_simulation$FixedCost <- FfixCost
+  
+  FF_simulation$Cost_Curve <- left_join(FF_simulation, cost_eff_curve, by = "Year")$Cost_Multiplier
+  
+  FF_simulation$TotlCost <- (FF_simulation$VariableCost + FF_simulation$FixedCost) * FF_simulation$Cost_Curve
+  
+  FF_simulation$OperationalProfit <- FF_simulation$NetRevenue - FF_simulation$TotlCost
+  
+  FF_simulation$Investment <- ifelse(FF_simulation$Year == StartYear, FFCAPEX, 0)
+  
+  FF_simulation$Reinvestment <- ifelse(FF_simulation$Year %in% seq(StartYear + FFREPEX_Freq, EndYear, by = FFREPEX_Freq), FFREPEX, 0)
+
+  FF_simulation$TotalCapex <- if (inv_trad == "yes") {
+    FF_simulation$Investment + FF_simulation$Reinvestment
+  } else {
+    0
+  }
+  
+  FF_simulation$CashFlow <- FF_simulation$OperationalProfit * (1- Income_Taxes) - FF_simulation$TotalCapex
+
+  FF_simulation$NetCashFlow <- FF_simulation$CashFlow / ((1 + WACC)^(FF_simulation$Year - StartYear))
+  
+  FF_simulation$IncomeTaxes <- FF_simulation$OperationalProfit * Income_Taxes
+  FF_simulation$RevenueTaxes <- FF_simulation$GrossRevenue * Revenue_Taxes
+
+  return(FF_simulation)
+  }
+  
+```
+
+**Função de Calculo do Equilíbrio**
+
+```{r}
+  #Função de Calculo do Equilíbrio
+
+  
+  simulation_calc <- function(Tariff_multiplier, FF_simulation, WACC, Revenue_Taxes, Income_Taxes, StartYear, SensCost, SensLeak, SLane) {
+  
+  FF_simulation_EB <- subset(FF_simulation, select = c("IDSeq","TOLLZONE", "Year", "Axles_Volume", "Traffic_Volume", "Tariff", "ROAD_ID", "TotalCapex", "MAINLINE"))
+  
+  if (SLane == "no") {
+    FF_simulation_EB <- select(FF_simulation_EB, TOLLZONE, IDSeq, Year, Axles_Volume, Traffic_Volume, Tariff, ROAD_ID,  TotalCapex, MAINLINE) %>% 
+    filter(MAINLINE == "Mainline")
+  } else {
+    FF_simulation_EB <- select(FF_simulation_EB, TOLLZONE, IDSeq, Year, Axles_Volume, Traffic_Volume, Tariff, ROAD_ID, TotalCapex, MAINLINE) %>% 
+    filter(MAINLINE == "Mainline" | MAINLINE == "Side Lane")
+  }                           
+  
+  FF_simulation_EB$Tariff <- FF_simulation$Tariff * Tariff_multiplier
+  
+  FF_simulation_EB$km_Tariff <- FF_simulation$km_Tariff  * Tariff_multiplier
+  
+  FF_simulation_EB$Leak_Curve <- left_join(FF_simulation_EB, leak_eff_curve, by = "Year")$Leak_Multiplier
+  
+  FF_simulation_EB$TotlCost <- (FF_simulation$TotlCost * SensCost)
+  
+  FF_simulation_EB$GrossRevenue <- FF_simulation_EB$Axles_Volume * FF_simulation_EB$Tariff * (1-FFEvasion * FF_simulation_EB$Leak_Curve) * SensLeak
+  
+  FF_simulation_EB$NetRevenue <- FF_simulation_EB$GrossRevenue * (1-Revenue_Taxes)
+  
+  FF_simulation_EB$OperationalProfit <- FF_simulation_EB$NetRevenue - FF_simulation_EB$TotlCost
+  
+  FF_simulation_EB$CashFlow <- FF_simulation_EB$OperationalProfit * (1- Income_Taxes) - FF_simulation_EB$TotalCapex
+  
+  FF_simulation_EB$NetCashFlow <- FF_simulation_EB$CashFlow / ((1 + WACC)^(FF_simulation_EB$Year - StartYear))
+  
+  FF_NPV_EB <- sum(FF_simulation_EB$NetCashFlow)
+  
+  FF_simulation_EB$IncomeTaxes <- FF_simulation_EB$OperationalProfit * Income_Taxes
+  FF_simulation_EB$RevenueTaxes <- FF_simulation_EB$GrossRevenue * Revenue_Taxes
+
+  list <- list(FF_NPV_EB, FF_simulation_EB)
+  
+  return(list)}
+
+```
+
+**Função para zerar o VPL (apoio para restrição de equilíbrio econômico)**
+
+```{r}
+  #Função para zerar o VPL
+  optimized_tariff_multiplier <- function(Trad_NPV, Initial_Tariff_multiplier) {
+  
+    upper_bound <- Initial_Tariff_multiplier * 1.3
+    lower_bound <- 0
+    tolerance <- 0.01
+    max_tolerance <- 1
+    target_npv <- Trad_NPV
+    num_iteracoes <- 0
+    max_iteracoes <- 100
+    Tariff_multiplier <- Initial_Tariff_multiplier
+    
+    NPV <- simulation_calc(Tariff_multiplier, FF_simulation, WACC, Revenue_Taxes, Income_Taxes, StartYear, SensCost, SensLeak, SLane)[[1]]
+
+ while (abs(NPV - Trad_NPV) > tolerance) {
+    Tariff_multiplier <- (upper_bound + lower_bound) / 2
+    NPV <- simulation_calc(Tariff_multiplier, FF_simulation, WACC, Revenue_Taxes, Income_Taxes, StartYear, SensCost, SensLeak, SLane)[[1]]
+
+    if (NPV < Trad_NPV) {
+      lower_bound <- Tariff_multiplier
+    } else {
+      upper_bound <- Tariff_multiplier
+    }
+
+    # Aumenta a tolerância após um certo número de iterações
+    num_iteracoes <- num_iteracoes + 1
+    if (num_iteracoes >= 50) {
+      tolerance <- 10*tolerance
+    }
+    
+    if (tolerance > max_tolerance || num_iteracoes >= max_iteracoes) {
+      cat("Interrompendo o loop: tolerância máxima atingida ou número máximo de iterações alcançado.\n")
+      break
+    }
+  }
+
+  return(Tariff_multiplier)
+  }
+```
+
+**Função para calcular o tarifa de reequilíbrio**
+
+```{r}
+#Função para calcular o tarifa de reequilíbrio 
+  
+tariff_ecbalance <- function(ecbalance, Trad_NPV) {
+
+  Var_Revenue <- sum(FF_simulation$GrossRevenue)/sum(Trad_simulation$GrossRevenue)
+  Var_Profit <- sum(FF_simulation$OperationalProfit)/sum(Trad_simulation$OperationalProfit)
+    
+  if(ecbalance == "Toll NPV") {
+    
+  Initial_Tariff_multiplier <- 1
+  Tariff_multiplier <- optimized_tariff_multiplier(Trad_NPV, Initial_Tariff_multiplier) } else {
+  Tariff_multiplier
+      if (ecbalance == "Toll Tariff") {
+      Tariff_multiplier <- 1} else {
+    
+          if (ecbalance == "Toll Revenue") {
+          Tariff_multiplier <- 1/Var_Revenue} else {
+      
+              if (ecbalance == "Toll Profit") {
+              Tariff_multiplier <- 1/Var_Profit} else { 
+              } 
+         }
+      }
+  }
+}
+```
+
+**Análises de Sensibilidade**
+
+```{r}
+#Análises de Sensibilidade
+
+simulate_sensibility <- function(Sensitivity, FF_simulation, WACC, Revenue_Taxes, Income_Taxes, StartYear, SensCost, SensLeak) { 
+    
+num_rows = length(Sensitivity)
+num_rows
+values <- num_rows * num_rows
+obfun <- fosimulation
+rest <- ecbalance
+scenario_Cost <- c("Base", "Cost +", "Cost -")
+scenarion_Leak <- c("Base", "Leak +", "Leak -")  
+counter = 0 
+
+data.results <- data.frame(scenario = character(values), 
+                           revenue = numeric(values),
+                           opex = numeric(values),
+                           profit = numeric(values),
+                           capex = numeric(values),
+                           npv = numeric(values),
+                           dtresults = numeric(values))
+
+for (i in 1:num_rows) {
+  SensCost <- Sensitivity$CostSensitivity[i] 
+  scenarion_name <- paste(ifelse(SensCost != 1,SensCost,""),scenario_Cost[i], sep = " ")
+
+  for (j in 1:num_rows) {
+  scenario_subname <- paste(ifelse(SensLeak != 1, SensLeak,""),scenarion_Leak[j], sep = " ")
+  SensLeak <- Sensitivity$LeakSensitivity[j]
+  
+  FF_ <- simulation_calc(Tariff_multiplier, FF_simulation, WACC, Revenue_Taxes, Income_Taxes, StartYear, SensCost, SensLeak, SLane)[[2]]
+
+  FF_Revenue_EB <- sum(FF_$GrossRevenue)
+  FF_OPEX_EB <- sum(FF_$TotlCost)
+  FF_Profit_EB <- sum(FF_$OperationalProfit)
+  FF_CAPEX_EB <- sum(FF_simulation_EB$TotalCapex)
+  FF_NPV_EB <- sum(FF_$NetCashFlow)
+  
+  counter <- counter + 1
+  
+  data.results$scenario[counter] <- paste(obfun, rest, scenarion_name, scenario_subname, sep = " ")
+  data.results$revenue[counter] <- FF_Revenue_EB
+  data.results$opex[counter] <- FF_OPEX_EB
+  data.results$profit[counter] <- FF_Profit_EB
+  data.results$capex[counter] <- FF_CAPEX_EB
+  data.results$npv[counter] <- FF_NPV_EB
+  
+  data.results$dtresults[counter] <- FF_
+
+  assign(paste("FF_", obfun, "_", rest, "_",scenarion_name,"_",scenario_subname, sep = ""), FF_) 
+  
+  SensCost = 1
+  SensLeak = 1
+}}
+}
+
+```
+
+### Resultados
+
+**Simulação**
+```{r}
+  
+Trad_simulation <- BaseCase_Simulation(TrafficandTariff, inputRoad, StartYear, EndYear, WACC, Revenue_Taxes, Income_Taxes, TradOBU, TradEvasion, costTDcash, costTDOBU, TFixCost, inv_trad, TCAPEX, TREPEX, TREPEX_Freq, leak_eff_curve, cost_eff_curve)
+
+Trad_NPV <- sum(Trad_simulation$NetCashFlow)
+
+FF_simulation <- Generate_Free_Flow_Simulation(inputDF, inputRoad, StartYear, EndYear, WACC, Revenue_Taxes, Income_Taxes, FFEvasion, FFOBU, costFFVideo, costTDOBU, costENFF, FfixCost, FFCAPEX, FFREPEX, FFREPEX_Freq, sensitivityPercCost, sensitivityPercLeak, leak_target, leak_eff, cost_target, cost_eff, fosimulation, ecbalance, SLane)
+
+Tariff_multiplier <- tariff_ecbalance(ecbalance, Trad_NPV)
+
+FF_simulation_EB <- simulation_calc(Tariff_multiplier, FF_simulation, WACC, Revenue_Taxes, Income_Taxes, StartYear, SensCost, SensLeak, SLane)[[2]]
+
+Sens_Analysis <- simulate_sensibility(Sensitivity, FF_simulation, WACC, Revenue_Taxes, Income_Taxes, StartYear, SensCost, SensLeak)
+
+
+  # Resultados
+
+  Trad_Profit <- sum(Trad_simulation$OperationalProfit)
+  Trad_Revenue <- sum(Trad_simulation$GrossRevenue)
+  Trad_CAPEX <- sum(Trad_simulation$TotalCapex)
+  Trad_OPEX <- sum(Trad_simulation$TotlCost)
+  Trad_kmTariff <- mean(Trad_simulation$km_Tariff)
+  Trad_IncomeTaxes <- sum(Trad_simulation$IncomeTaxes)
+  Trad_RevenueTaxes <- sum(Trad_simulation$RevenueTaxes)
+  
+  FF_NPV <- sum(FF_simulation$NetCashFlow)
+  FF_Profit <- sum(FF_simulation$OperationalProfit)
+  FF_Revenue <- sum(FF_simulation$GrossRevenue)
+  FF_OPEX <- sum(FF_simulation$TotlCost)
+  FF_CAPEX <- sum(FF_simulation$TotalCapex)
+  FF_kmTariff <- mean(FF_simulation$km_Tariff)
+  FF_IncomeTaxes <- sum(FF_simulation$IncomeTaxes)
+  FF_RevenueTaxes <- sum(FF_simulation$RevenueTaxes)
+  
+  FF_NPV_EB <- sum(FF_simulation_EB$NetCashFlow)
+  FF_Profit_EB <- sum(FF_simulation_EB$OperationalProfit)
+  FF_Revenue_EB <- sum(FF_simulation_EB$GrossRevenue)
+  FF_OPEX_EB <- sum(FF_simulation_EB$TotlCost)
+  FF_CAPEX_EB <- sum(FF_simulation_EB$TotalCapex)
+  FF_kmTariff_EB <- mean(FF_simulation_EB$km_Tariff)
+  FF_IncomeTaxes_EB <- sum(FF_simulation_EB$IncomeTaxes)
+  FF_RevenueTaxes_EB <- sum(FF_simulation_EB$RevenueTaxes)
+  
+  FF_kmTariffList <- data.frame(IDSeq = FF_simulation_EB$IDSeq, kmTariff = FF_simulation_EB$km_Tariff)
+  
+  Var_Revenue <- sum(FF_simulation$GrossRevenue)/sum(Trad_simulation$GrossRevenue)-1
+  Var_Profit <- sum(FF_simulation$OperationalProfit)/sum(Trad_simulation$OperationalProfit)-1
+  Var_OPEX <- sum(FF_simulation$TotlCost)/sum(Trad_simulation$TotlCost)-1
+  Var_CAPEX <- sum(FF_simulation$TotalCapex)/sum(Trad_simulation$TotalCapex)-1
+  Var_NPV <- sum(FF_simulation$NetCashFlow)/sum(Trad_simulation$NetCashFlow)-1
+  Var_kmTariff <- (FF_kmTariff/Trad_kmTariff)-1
+  Var_IncomeTaxes <- sum(FF_simulation$IncomeTaxes)/sum(Trad_simulation$IncomeTaxes)-1
+  Var_RevenueTaxes <- sum(FF_simulation$RevenueTaxes)/sum(Trad_simulation$RevenueTaxes)-1
+  
+  
+  Var_Revenue_EB <- sum(FF_simulation_EB$GrossRevenue)/sum(Trad_simulation$GrossRevenue)-1
+  Var_Profit_EB <- sum(FF_simulation_EB$OperationalProfit)/sum(Trad_simulation$OperationalProfit)-1
+  Var_OPEX_EB <- sum(FF_simulation_EB$TotlCost)/sum(Trad_simulation$TotlCost)-1
+  Var_CAPEX_EB <- sum(FF_simulation_EB$TotalCapex)/sum(Trad_simulation$TotalCapex)-1
+  Var_NPV_EB <- sum(FF_simulation_EB$NetCashFlow)/sum(Trad_simulation$NetCashFlow)-1
+  Var_kmTariff_EB <- (FF_kmTariff_EB/Trad_kmTariff)-1
+  Var_IncomeTaxes_EB <- sum(FF_simulation_EB$IncomeTaxes)/sum(Trad_simulation$IncomeTaxes)-1
+  Var_RevenueTaxes_EB <- sum(FF_simulation_EB$RevenueTaxes)/sum(Trad_simulation$RevenueTaxes)-1
+  
+  # Formatação dos resultados
+  
+  Trad_NPV <- format(Trad_NPV, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  Trad_Profit <- format(Trad_Profit, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  Trad_Revenue <- format(Trad_Revenue, big.mark = ".", decimal.mark = ",", scientific = FALSE)    
+  Trad_CAPEX <- format(Trad_CAPEX, big.mark = ".", decimal.mark = ",", scientific = FALSE)    
+  Trad_OPEX <- format(Trad_OPEX, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  Trad_kmTariff <- round(Trad_kmTariff, 4)
+  Trad_IncomeTaxes <- format(Trad_IncomeTaxes, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  Trad_RevenueTaxes <- format(Trad_RevenueTaxes, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  
+  FF_CAPEX <- format(FF_CAPEX, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  FF_Profit <- format(FF_Profit, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  FF_OPEX <- format(FF_OPEX, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  FF_NPV <- format(FF_NPV, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  FF_Revenue <- format(FF_Revenue, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  FF_kmTariff <- round(FF_kmTariff, 4)
+  FF_IncomeTaxes <- format(FF_IncomeTaxes, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  FF_RevenueTaxes <- format(FF_RevenueTaxes, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  
+  FF_NPV_EB <- format(FF_NPV_EB, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  FF_Profit_EB <- format(FF_Profit_EB, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  FF_Revenue_EB <- format(FF_Revenue_EB, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  FF_CAPEX_EB <- format(FF_CAPEX_EB, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  FF_OPEX_EB <- format(FF_OPEX_EB, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  FF_kmTariff_EB <- round(FF_kmTariff_EB, 4)
+  FF_IncomeTaxes_EB <- format(FF_IncomeTaxes_EB, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  FF_RevenueTaxes_EB <- format(FF_RevenueTaxes_EB, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  
+  Var_Revenue <- sprintf("%.2f%%", Var_Revenue*100)
+  Var_Profit <- sprintf("%.2f%%", Var_Profit*100)
+  Var_OPEX <- sprintf("%.2f%%", Var_OPEX*100)
+  Var_CAPEX <- sprintf("%.2f%%", Var_CAPEX*100)
+  Var_NPV <- sprintf("%.2f%%", Var_NPV*100)
+  Var_kmTariff <- sprintf("%.2f%%", Var_kmTariff*100)
+  Var_IncomeTaxes <- sprintf("%.2f%%", Var_IncomeTaxes*100)
+  Var_RevenueTaxes <- sprintf("%.2f%%", Var_RevenueTaxes*100)
+  
+  Var_Revenue_EB <- sprintf("%.2f%%", Var_Revenue_EB*100)
+  Var_Profit_EB <- sprintf("%.2f%%", Var_Profit_EB*100)
+  Var_OPEX_EB <- sprintf("%.2f%%", Var_OPEX_EB*100)
+  Var_CAPEX_EB <- sprintf("%.2f%%", Var_CAPEX_EB*100)
+  Var_NPV_EB <- sprintf("%.2f%%", Var_NPV_EB*100)
+  Var_kmTariff_EB <- sprintf("%.2f%%", Var_kmTariff_EB*100)
+  Var_IncomeTaxes_EB <- sprintf("%.2f%%", Var_IncomeTaxes_EB*100)
+  Var_RevenueTaxes_EB <- sprintf("%.2f%%", Var_RevenueTaxes_EB*100)
+  
+  # Table Plot
+ summ.results <- data.frame(Collection = c("Traditional Toll", "Free Flow", "Var %", "Free Flow (Economic Balance)", "Var %"), 
+                            Revenue = c(Trad_Revenue, FF_Revenue, Var_Revenue, FF_Revenue_EB, Var_Revenue_EB), 
+                            OPEX = c(Trad_OPEX, FF_OPEX, Var_OPEX, FF_OPEX_EB, Var_OPEX_EB),
+                            Profit = c(Trad_Profit, FF_Profit, Var_Profit, FF_Profit_EB, Var_Profit_EB),
+                            CAPEX = c(Trad_CAPEX, FF_CAPEX, Var_CAPEX, FF_CAPEX_EB, Var_CAPEX_EB), 
+                            NPV = c(Trad_NPV, FF_NPV, Var_NPV, FF_NPV_EB, Var_NPV_EB),
+                            kmTariff = c(Trad_kmTariff, FF_kmTariff, Var_kmTariff, FF_kmTariff_EB, Var_kmTariff_EB),
+                            IncomeTaxes = c(Trad_IncomeTaxes, FF_IncomeTaxes, Var_IncomeTaxes, FF_IncomeTaxes_EB, Var_IncomeTaxes_EB),
+                            RevenueTaxes = c(Trad_RevenueTaxes, FF_RevenueTaxes, Var_RevenueTaxes, FF_RevenueTaxes_EB, Var_RevenueTaxes_EB))
+
+datatable(summ.results)
+
+```
+
+```
+
+
